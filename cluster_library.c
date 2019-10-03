@@ -692,7 +692,7 @@ cluster_node_add_slave(redisClusterNode *master, redisClusterNode *slave)
      r->element[0]->type == TYPE_BULK && r->element[1]->type == TYPE_INT)
 
 /* Use the output of CLUSTER SLOTS to map our nodes */
-static int cluster_map_slots(redisCluster *c, clusterReply *r) {
+static int cluster_map_slots(redisCluster *c, RedisSock *seed TSRMLS_DC, clusterReply *r) {
     redisClusterNode *pnode, *master, *slave;
     redisSlotRange range;
     int i,j, hlen, klen;
@@ -700,6 +700,13 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
     clusterReply *r2, *r3;
     unsigned short port;
     char *host, key[1024];
+    char hbuf[1024], *pos, *address, *schema = NULL;
+
+    // Get the schema from the seed host
+    address = ZSTR_VAL(seed->host);
+    if ((pos = strstr(address, "://")) != NULL) {
+        schema = estrndup(address, pos - address);
+    }
 
     for (i = 0; i < r->elements; i++) {
         // Inner response
@@ -707,6 +714,7 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
 
         // Validate outer and master slot
         if (!VALIDATE_SLOTS_OUTER(r2) || !VALIDATE_SLOTS_INNER(r2->element[2])) {
+            if (schema) efree(schema);
             return -1;
         }
 
@@ -719,6 +727,12 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
         host = r3->element[0]->str;
         hlen = r3->element[0]->len;
         port = (unsigned short)r3->element[1]->integer;
+
+        // Use the schema of the seed if possible
+        if (schema && strstr(host, "://") == NULL) {
+             hlen = snprintf(hbuf, sizeof(hbuf), "%s://%s", schema, host);
+             host = (char*)hbuf;
+        }
 
         // If the node is new, create and add to nodes.  Otherwise use it.
         klen = snprintf(key, sizeof(key), "%s:%d", host, port);
@@ -733,6 +747,7 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
         for (j = 3; j< r2->elements; j++) {
             r3 = r2->element[j];
             if (!VALIDATE_SLOTS_INNER(r3)) {
+                if (schema) efree(schema);
                 return -1;
             }
 
@@ -755,6 +770,8 @@ static int cluster_map_slots(redisCluster *c, clusterReply *r) {
         range.low = low; range.high = high;
         zend_llist_add_element(&master->slots, &range);
     }
+
+    if (schema) efree(schema);
 
     // Success
     return 0;
@@ -1131,7 +1148,7 @@ PHP_REDIS_API int cluster_map_keyspace(redisCluster *c TSRMLS_DC) {
         // Parse out cluster nodes.  Flag mapped if we are valid
         slots = cluster_get_slots(seed TSRMLS_CC);
         if (slots) {
-            mapped = !cluster_map_slots(c, slots);
+            mapped = !cluster_map_slots(c, seed TSRMLS_CC, slots);
             // Bin anything mapped, if we failed somewhere
             if (!mapped) {
                 memset(c->master, 0, sizeof(redisClusterNode*)*REDIS_CLUSTER_SLOTS);
